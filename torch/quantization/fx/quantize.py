@@ -1,3 +1,4 @@
+import operator
 import torch
 from torch.fx import (  # type: ignore
     GraphModule,
@@ -28,6 +29,7 @@ from ..quantize import (
 
 from ..utils import (
     get_combined_dict,
+    get_qconfig_dtypes,
     get_swapped_custom_module_class,
     activation_is_quantized,
     weight_is_quantized,
@@ -231,7 +233,10 @@ def insert_observer_for_output_of_the_node(
             # we will not consider the output to be observed
             if (input_is_observed(input_node.args[0]) or
                     input_is_observed(input_node.args[1])):
-                observed_node_names_set.add(node.name)
+                # TODO(before land): extend to all binary ops and reuse mapping
+                is_sum_not_fp16 = input_node.target == torch.sum and activation_dtype(qconfig) != torch.float16
+                if not is_sum_not_fp16:
+                    observed_node_names_set.add(node.name)
 
             if activation_dtype(qconfig) == torch.float16:
                 # observer for outputs
@@ -275,6 +280,8 @@ def insert_observer_for_input_arg_of_observed_node(
         activation_post_process_map: Dict[str, torch.quantization.ObserverBase],
         env: Dict[str, str], observed_graph: Graph,
         load_arg: Callable):
+    # print('insert_observer_for_input_arg_of_observed_node', node.format_node())
+    # print('in obs', node.name in observed_node_names_set, 'in quant', node.name in quants)
     if node.name not in observed_node_names_set and node.name in quants:
         _, activation_post_process_ctr = quants[node.name]
         if activation_post_process_ctr is not None:
@@ -806,6 +813,39 @@ class Quantizer:
                     'CopyNode of type ' + node.op + ' is not handled'
                 quantized = node_arg_is_quantized(node.args[0])
 
+            elif isinstance(obj, BinaryOp):
+                # for now, special case sum to unblock
+                # TODO(before land): clean things up:
+                #  * reuse the mapping from BinaryOp
+                #  * ideally stop special casing BinaryOp and make things more general
+                assert self.qconfig_map is not None
+                local_qconfig = self.qconfig_map[node.name]
+                dtypes = get_qconfig_dtypes(local_qconfig)
+
+                # TODO(before land): reuse this instead of copy-paste
+                all_bop_dtypes = [
+                    (torch.quint8, torch.qint8, None),
+                    (torch.float16, torch.float16, None),
+                ]
+                float16_dtypes = [
+                    (torch.float16, torch.float16, None)
+                ]
+                supported_dtypes : Dict[Union[Callable, str], List[Tuple[torch.dtype, torch.dtype, None]]] = {
+                    operator.add: all_bop_dtypes,
+                    torch.add: all_bop_dtypes,
+                    operator.mul: all_bop_dtypes,
+                    torch.mul: all_bop_dtypes,
+                    torch.bmm: float16_dtypes,
+                    torch.sub: float16_dtypes,
+                    operator.sub: float16_dtypes,
+                    torch.div: float16_dtypes,
+                    operator.truediv: float16_dtypes,
+                    torch.sum: float16_dtypes
+                }
+                if dtypes not in supported_dtypes[obj.binary_op]:
+                    return False
+
+            # TODO: this refers to a qconfig defined outside of this function, should clean up
             if not activation_is_statically_quantized(qconfig) or \
                not input_output_observed(obj):
                 quantized = False
